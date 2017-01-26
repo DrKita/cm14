@@ -32,6 +32,7 @@ enum arizona_type {
 	WM1840 = 8,
 	WM1831 = 9,
 	CS47L24 = 10,
+	CS47L35 = 11,
 };
 
 #define ARIZONA_IRQ_GP1                    0
@@ -169,6 +170,9 @@ struct arizona {
 #if defined(CONFIG_PM_SLEEP) && defined(CONFIG_MFD_ARIZONA_DEFERRED_RESUME)
 	struct work_struct deferred_resume_work;
 #endif
+
+	struct mutex rate_lock;
+	struct mutex dspclk_ena_lock;
 };
 
 #define ARIZONA_DVFS_SR1_RQ          0x00000001
@@ -188,12 +192,21 @@ int arizona_request_irq(struct arizona *arizona, int irq, char *name,
 void arizona_free_irq(struct arizona *arizona, int irq, void *data);
 int arizona_set_irq_wake(struct arizona *arizona, int irq, int on);
 
+#ifdef CONFIG_MFD_WM5102
 int wm5102_patch(struct arizona *arizona);
+#else
+static inline int wm5102_patch(struct arizona *arizona)
+{
+	return 0;
+}
+#endif
+
 int florida_patch(struct arizona *arizona);
 int wm8997_patch(struct arizona *arizona);
 int vegas_patch(struct arizona *arizona);
 int clearwater_patch(struct arizona *arizona);
 int largo_patch(struct arizona *arizona);
+int marley_patch(struct arizona *arizona);
 
 extern int arizona_of_get_named_gpio(struct arizona *arizona, const char *prop,
 				     bool mandatory);
@@ -206,4 +219,9 @@ extern void arizona_florida_mute_analog(struct arizona* arizona,
 					unsigned int mute);
 extern void arizona_florida_clear_input(struct arizona *arizona);
 
+static inline int arizona_of_read_s32(struct arizona *arizona, const char *prop,
+				      bool mandatory, s32 *data)
+{
+	return arizona_of_read_u32(arizona, prop, mandatory, (u32 *)data);
+}
 #endif

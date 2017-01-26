@@ -37,13 +37,48 @@ struct vegas_priv {
 	struct arizona_fll fll[2];
 };
 
-static int vegas_in1mux_ev(struct snd_soc_dapm_widget *w,
-				struct snd_kcontrol *kcontrol,
-				int event);
+static int vegas_put_volsw_locked(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+	int ret;
 
-static int vegas_in2mux_ev(struct snd_soc_dapm_widget *w,
-				struct snd_kcontrol *kcontrol,
-				int event);
+	mutex_lock_nested(&codec->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+
+	ret = snd_soc_put_volsw(kcontrol, ucontrol);
+
+	mutex_unlock(&codec->card->dapm_mutex);
+
+	return ret;
+}
+
+static int vegas_put_spk_edre(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+	unsigned int val = 0;
+
+	mutex_lock_nested(&codec->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+
+	if (ucontrol->value.integer.value[0] != 0)
+		val |= CLEARWATER_EDRE_OUT4L_THR1_ENA_MASK |
+			CLEARWATER_EDRE_OUT4L_THR2_ENA_MASK;
+
+	if (ucontrol->value.integer.value[1] != 0)
+		val |= CLEARWATER_EDRE_OUT4R_THR1_ENA_MASK |
+			CLEARWATER_EDRE_OUT4R_THR2_ENA_MASK;
+
+	snd_soc_update_bits(codec, CLEARWATER_EDRE_ENABLE,
+			    CLEARWATER_EDRE_OUT4L_THR1_ENA_MASK |
+			    CLEARWATER_EDRE_OUT4R_THR1_ENA_MASK |
+			    CLEARWATER_EDRE_OUT4L_THR2_ENA_MASK |
+			    CLEARWATER_EDRE_OUT4R_THR2_ENA_MASK,
+			    val);
+
+	mutex_unlock(&codec->card->dapm_mutex);
+
+	return 0;
+}
 
 static int vegas_asrc_ev(struct snd_soc_dapm_widget *w,
 			  struct snd_kcontrol *kcontrol,
@@ -77,6 +112,96 @@ static int vegas_asrc_ev(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
+static int vegas_in1mux_put(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_dapm_widget_list *wlist = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_dapm_widget *widget = wlist->widgets[0];
+	struct snd_soc_codec *codec = widget->codec;
+	struct vegas_priv *vegas = snd_soc_codec_get_drvdata(codec);
+	struct arizona *arizona = vegas->core.arizona;
+	const struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
+	unsigned int mux, inmode;
+	unsigned int mode_val, src_val;
+
+	mux = ucontrol->value.enumerated.item[0];
+	if (mux > 1)
+		return -EINVAL;
+
+	/* L and R registers have same shift and mask */
+	inmode = arizona->pdata.inmode[2 * mux];
+	src_val = mux << ARIZONA_IN1L_SRC_SHIFT;
+	if (inmode & ARIZONA_INMODE_SE)
+		src_val |= 1 << ARIZONA_IN1L_SRC_SE_SHIFT;
+
+	switch (arizona->pdata.inmode[0]) {
+	case ARIZONA_INMODE_DMIC:
+		if (mux)
+			mode_val = 0;	/* B always analogue */
+		else
+			mode_val = 1 << ARIZONA_IN1_MODE_SHIFT;
+
+		snd_soc_update_bits(codec, ARIZONA_IN1L_CONTROL,
+				    ARIZONA_IN1_MODE_MASK, mode_val);
+
+		/* IN1A is digital so L and R must change together */
+		/* src_val setting same for both registers */
+		snd_soc_update_bits(codec,
+				    ARIZONA_ADC_DIGITAL_VOLUME_1L,
+				    ARIZONA_IN1L_SRC_MASK |
+				    ARIZONA_IN1L_SRC_SE_MASK, src_val);
+		snd_soc_update_bits(codec,
+				    ARIZONA_ADC_DIGITAL_VOLUME_1R,
+				    ARIZONA_IN1R_SRC_MASK |
+				    ARIZONA_IN1R_SRC_SE_MASK, src_val);
+		break;
+	default:
+		/* both analogue */
+		snd_soc_update_bits(codec,
+				    e->reg,
+				    ARIZONA_IN1L_SRC_MASK |
+				    ARIZONA_IN1L_SRC_SE_MASK,
+				    src_val);
+		break;
+	}
+
+	return snd_soc_dapm_put_enum_virt(kcontrol, ucontrol);
+}
+
+static int vegas_in2mux_put(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_dapm_widget_list *wlist = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_dapm_widget *widget = wlist->widgets[0];
+	struct snd_soc_codec *codec = widget->codec;
+	struct vegas_priv *vegas = snd_soc_codec_get_drvdata(codec);
+	struct arizona *arizona = vegas->core.arizona;
+	unsigned int mux, inmode, src_val, mode_val;
+
+	mux = ucontrol->value.enumerated.item[0];
+	if (mux > 1)
+		return -EINVAL;
+
+	inmode = arizona->pdata.inmode[1 + (2 * mux)];
+	if (inmode & ARIZONA_INMODE_DMIC)
+		mode_val = 1 << ARIZONA_IN2_MODE_SHIFT;
+	else
+		mode_val = 0;
+
+	src_val = mux << ARIZONA_IN2L_SRC_SHIFT;
+	if (inmode & ARIZONA_INMODE_SE)
+		src_val |= 1 << ARIZONA_IN2L_SRC_SE_SHIFT;
+
+	snd_soc_update_bits(codec, ARIZONA_IN2L_CONTROL,
+			    ARIZONA_IN2_MODE_MASK, mode_val);
+
+	snd_soc_update_bits(codec, ARIZONA_ADC_DIGITAL_VOLUME_2L,
+			    ARIZONA_IN2L_SRC_MASK | ARIZONA_IN2L_SRC_SE_MASK,
+			    src_val);
+
+	return snd_soc_dapm_put_enum_virt(kcontrol, ucontrol);
+}
+
 static const char * const vegas_inmux_texts[] = {
 	"A",
 	"B",
@@ -98,12 +223,15 @@ static const SOC_ENUM_SINGLE_DECL(vegas_in2mux_enum,
 				  vegas_inmux_texts);
 
 static const struct snd_kcontrol_new vegas_in1mux[2] = {
-	SOC_DAPM_ENUM("IN1L Mux", vegas_in1muxl_enum),
-	SOC_DAPM_ENUM("IN1R Mux", vegas_in1muxr_enum),
+	SOC_DAPM_ENUM_EXT("IN1L Mux", vegas_in1muxl_enum,
+			  snd_soc_dapm_get_enum_double, vegas_in1mux_put),
+	SOC_DAPM_ENUM_EXT("IN1R Mux", vegas_in1muxr_enum,
+			  snd_soc_dapm_get_enum_double, vegas_in1mux_put),
 };
 
 static const struct snd_kcontrol_new vegas_in2mux =
-	SOC_DAPM_ENUM("IN2 Mux", vegas_in2mux_enum);
+	SOC_DAPM_ENUM_EXT("IN2 Mux", vegas_in2mux_enum,
+			  snd_soc_dapm_get_enum_double, vegas_in2mux_put);
 
 static DECLARE_TLV_DB_SCALE(ana_tlv, 0, 100, 0);
 static DECLARE_TLV_DB_SCALE(eq_tlv, -1200, 100, 0);
@@ -213,10 +341,10 @@ ARIZONA_MIXER_CONTROLS("LHPF2", ARIZONA_HPLP2MIX_INPUT_1_SOURCE),
 ARIZONA_MIXER_CONTROLS("LHPF3", ARIZONA_HPLP3MIX_INPUT_1_SOURCE),
 ARIZONA_MIXER_CONTROLS("LHPF4", ARIZONA_HPLP4MIX_INPUT_1_SOURCE),
 
-SND_SOC_BYTES("LHPF1 Coefficients", ARIZONA_HPLPF1_2, 1),
-SND_SOC_BYTES("LHPF2 Coefficients", ARIZONA_HPLPF2_2, 1),
-SND_SOC_BYTES("LHPF3 Coefficients", ARIZONA_HPLPF3_2, 1),
-SND_SOC_BYTES("LHPF4 Coefficients", ARIZONA_HPLPF4_2, 1),
+ARIZONA_LHPF_CONTROL("LHPF1 Coefficients", ARIZONA_HPLPF1_2),
+ARIZONA_LHPF_CONTROL("LHPF2 Coefficients", ARIZONA_HPLPF2_2),
+ARIZONA_LHPF_CONTROL("LHPF3 Coefficients", ARIZONA_HPLPF3_2),
+ARIZONA_LHPF_CONTROL("LHPF4 Coefficients", ARIZONA_HPLPF4_2),
 
 SOC_ENUM("LHPF1 Mode", arizona_lhpf1_mode),
 SOC_ENUM("LHPF2 Mode", arizona_lhpf2_mode),
@@ -250,8 +378,17 @@ SOC_DOUBLE_R("LINEOUT Digital Switch", ARIZONA_DAC_DIGITAL_VOLUME_2L,
 	     ARIZONA_DAC_DIGITAL_VOLUME_2R, ARIZONA_OUT2L_MUTE_SHIFT, 1, 1),
 SOC_SINGLE("EPOUT Digital Switch", ARIZONA_DAC_DIGITAL_VOLUME_3L,
 	     ARIZONA_OUT3L_MUTE_SHIFT, 1, 1),
-SOC_DOUBLE_R("Speaker Digital Switch", ARIZONA_DAC_DIGITAL_VOLUME_4L,
-	     ARIZONA_DAC_DIGITAL_VOLUME_4R, ARIZONA_OUT4L_MUTE_SHIFT, 1, 1),
+
+/* There isn't a SOC_DOUBLE_R_EXT macro that we can use for this */
+{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Speaker Digital Switch",
+	.info = snd_soc_info_volsw,
+	.get = snd_soc_get_volsw, .put = vegas_put_volsw_locked,
+	.private_value = SOC_DOUBLE_R_VALUE(ARIZONA_DAC_DIGITAL_VOLUME_4L,
+					    ARIZONA_DAC_DIGITAL_VOLUME_4R,
+					    ARIZONA_OUT4L_MUTE_SHIFT,
+					    1, 1)
+},
+
 SOC_DOUBLE_R("SPKDAT Digital Switch", ARIZONA_DAC_DIGITAL_VOLUME_5L,
 	     ARIZONA_DAC_DIGITAL_VOLUME_5R, ARIZONA_OUT5L_MUTE_SHIFT, 1, 1),
 
@@ -274,11 +411,11 @@ SOC_DOUBLE("SPKDAT Switch", ARIZONA_PDM_SPK1_CTRL_1, ARIZONA_SPK1L_MUTE_SHIFT,
 	   ARIZONA_SPK1R_MUTE_SHIFT, 1, 1),
 
 SOC_DOUBLE("HPOUT DRE Switch", ARIZONA_DRE_ENABLE,
-	   ARIZONA_DRE1L_ENA_SHIFT, ARIZONA_DRE1R_ENA_SHIFT, 1, 0),
+	   VEGAS_DRE1L_ENA_SHIFT, VEGAS_DRE1R_ENA_SHIFT, 1, 0),
 SOC_DOUBLE("LINEOUT DRE Switch", ARIZONA_DRE_ENABLE,
-	   ARIZONA_DRE2L_ENA_SHIFT, ARIZONA_DRE2R_ENA_SHIFT, 1, 0),
+	   VEGAS_DRE2L_ENA_SHIFT, VEGAS_DRE2R_ENA_SHIFT, 1, 0),
 SOC_SINGLE("EPOUT DRE Switch", ARIZONA_DRE_ENABLE,
-	   ARIZONA_DRE3L_ENA_SHIFT, 1, 0),
+	   VEGAS_DRE3L_ENA_SHIFT, 1, 0),
 
 SOC_SINGLE("DRE Threshold", ARIZONA_DRE_CONTROL_2,
 	   ARIZONA_DRE_T_LOW_SHIFT, 63, 0),
@@ -291,6 +428,22 @@ SOC_SINGLE("DRE TC Fast", ARIZONA_DRE_CONTROL_1,
 
 SOC_SINGLE("DRE Analogue Volume Delay", ARIZONA_DRE_CONTROL_2,
 	   ARIZONA_DRE_ALOG_VOL_DELAY_SHIFT, 15, 0),
+
+SOC_DOUBLE_EXT("HPOUT EDRE Switch", CLEARWATER_EDRE_ENABLE,
+	   CLEARWATER_EDRE_OUT1L_THR1_ENA_SHIFT,
+	   CLEARWATER_EDRE_OUT1R_THR1_ENA_SHIFT, 1, 0,
+	   snd_soc_get_volsw, vegas_put_volsw_locked),
+SOC_DOUBLE_EXT("LINEOUT EDRE Switch", CLEARWATER_EDRE_ENABLE,
+	   CLEARWATER_EDRE_OUT2L_THR1_ENA_SHIFT,
+	   CLEARWATER_EDRE_OUT2R_THR1_ENA_SHIFT, 1, 0,
+	   snd_soc_get_volsw, vegas_put_volsw_locked),
+SOC_SINGLE_EXT("EPOUT EDRE Switch", CLEARWATER_EDRE_ENABLE,
+	   CLEARWATER_EDRE_OUT3L_THR1_ENA_SHIFT, 1, 0,
+	   snd_soc_get_volsw, vegas_put_volsw_locked),
+SOC_DOUBLE_EXT("SPKOUT EDRE Switch", CLEARWATER_EDRE_ENABLE,
+	   CLEARWATER_EDRE_OUT4L_THR1_ENA_SHIFT,
+	   CLEARWATER_EDRE_OUT4R_THR1_ENA_SHIFT, 1, 0,
+	   snd_soc_get_volsw, vegas_put_spk_edre),
 
 SOC_ENUM("Output Ramp Up", arizona_out_vi_ramp),
 SOC_ENUM("Output Ramp Down", arizona_out_vd_ramp),
@@ -421,7 +574,7 @@ ARIZONA_MUX_ENUMS(ISRC2INT2, ARIZONA_ISRC2INT2MIX_INPUT_1_SOURCE);
 ARIZONA_MUX_ENUMS(ISRC2DEC1, ARIZONA_ISRC2DEC1MIX_INPUT_1_SOURCE);
 ARIZONA_MUX_ENUMS(ISRC2DEC2, ARIZONA_ISRC2DEC2MIX_INPUT_1_SOURCE);
 
-static const char *vegas_aec_loopback_texts[] = {
+static const char * const vegas_aec_loopback_texts[] = {
 	"HPOUTL", "HPOUTR", "LINEOUTL", "LINEOUTR", "EPOUT",
 	"SPKOUTL", "SPKOUTR", "SPKDATL", "SPKDATR",
 };
@@ -474,12 +627,9 @@ SND_SOC_DAPM_INPUT("IN1BR"),
 SND_SOC_DAPM_INPUT("IN2A"),
 SND_SOC_DAPM_INPUT("IN2B"),
 
-SND_SOC_DAPM_MUX_E("IN1L Mux", SND_SOC_NOPM, 0, 0, &vegas_in1mux[0],
-			vegas_in1mux_ev, SND_SOC_DAPM_PRE_PMU),
-SND_SOC_DAPM_MUX_E("IN1R Mux", SND_SOC_NOPM, 0, 0, &vegas_in1mux[1],
-			vegas_in1mux_ev, SND_SOC_DAPM_PRE_PMU),
-SND_SOC_DAPM_MUX_E("IN2 Mux", SND_SOC_NOPM, 0, 0, &vegas_in2mux,
-			vegas_in2mux_ev, SND_SOC_DAPM_PRE_PMU),
+SND_SOC_DAPM_MUX("IN1L Mux", SND_SOC_NOPM, 0, 0, &vegas_in1mux[0]),
+SND_SOC_DAPM_MUX("IN1R Mux", SND_SOC_NOPM, 0, 0, &vegas_in1mux[1]),
+SND_SOC_DAPM_MUX("IN2 Mux", SND_SOC_NOPM, 0, 0, &vegas_in2mux),
 
 SND_SOC_DAPM_OUTPUT("DRC1 Signal Activity"),
 
@@ -673,19 +823,24 @@ SND_SOC_DAPM_AIF_IN("AIF3RX2", NULL, 0,
 
 SND_SOC_DAPM_PGA_E("OUT1L", SND_SOC_NOPM,
 		   ARIZONA_OUT1L_ENA_SHIFT, 0, NULL, 0, arizona_hp_ev,
-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD |
+		   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU),
 SND_SOC_DAPM_PGA_E("OUT1R", SND_SOC_NOPM,
 		   ARIZONA_OUT1R_ENA_SHIFT, 0, NULL, 0, arizona_hp_ev,
-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD |
+		   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU),
 SND_SOC_DAPM_PGA_E("OUT2L", ARIZONA_OUTPUT_ENABLES_1,
 		   ARIZONA_OUT2L_ENA_SHIFT, 0, NULL, 0, arizona_out_ev,
-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD |
+		   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU),
 SND_SOC_DAPM_PGA_E("OUT2R", ARIZONA_OUTPUT_ENABLES_1,
 		   ARIZONA_OUT2R_ENA_SHIFT, 0, NULL, 0, arizona_out_ev,
-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD |
+		   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU),
 SND_SOC_DAPM_PGA_E("OUT3", ARIZONA_OUTPUT_ENABLES_1,
 		   ARIZONA_OUT3L_ENA_SHIFT, 0, NULL, 0, arizona_out_ev,
-		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
+		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD |
+		   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU),
 SND_SOC_DAPM_PGA_E("OUT5L", ARIZONA_OUTPUT_ENABLES_1,
 		   ARIZONA_OUT5L_ENA_SHIFT, 0, NULL, 0, arizona_out_ev,
 		   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMU),
@@ -870,6 +1025,13 @@ static const struct snd_soc_dapm_route vegas_dapm_routes[] = {
 	{ "OUT5L", NULL, "SYSCLK" },
 	{ "OUT5R", NULL, "SYSCLK" },
 
+	{ "IN1AL", NULL, "SYSCLK" },
+	{ "IN1AR", NULL, "SYSCLK" },
+	{ "IN1BL", NULL, "SYSCLK" },
+	{ "IN1BR", NULL, "SYSCLK" },
+	{ "IN2A", NULL, "SYSCLK" },
+	{ "IN2B", NULL, "SYSCLK" },
+
 	{ "SPD1", NULL, "SYSCLK" },
 	{ "SPD1", NULL, "SPD1TX1" },
 	{ "SPD1", NULL, "SPD1TX2" },
@@ -877,6 +1039,9 @@ static const struct snd_soc_dapm_route vegas_dapm_routes[] = {
 	{ "MICBIAS1", NULL, "MICVDD" },
 	{ "MICBIAS2", NULL, "MICVDD" },
 	{ "MICBIAS3", NULL, "MICVDD" },
+
+	{ "Tone Generator 1", NULL, "SYSCLK" },
+	{ "Tone Generator 2", NULL, "SYSCLK" },
 
 	{ "Tone Generator 1", NULL, "TONE" },
 	{ "Tone Generator 2", NULL, "TONE" },
@@ -1065,6 +1230,8 @@ static const struct snd_soc_dapm_route vegas_dapm_routes[] = {
 	{ "SPKDATL", NULL, "OUT5L" },
 	{ "SPKDATR", NULL, "OUT5R" },
 
+	{ "MICSUPP", NULL, "SYSCLK" },
+
 	{ "DRC1 Signal Activity", NULL, "DRC1L" },
 	{ "DRC1 Signal Activity", NULL, "DRC1R" },
 };
@@ -1177,88 +1344,6 @@ static struct snd_soc_dai_driver vegas_dai[] = {
 		.ops = &arizona_simple_dai_ops,
 	},
 };
-
-static int vegas_in1mux_ev(struct snd_soc_dapm_widget *w,
-				struct snd_kcontrol *kcontrol,
-				int event)
-{
-	struct snd_soc_codec *codec = w->codec;
-	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
-	unsigned int left_mux, right_mux, in1mode, old;
-
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		/* Validate the mux configuration */
-		left_mux = snd_soc_read(codec, ARIZONA_ADC_DIGITAL_VOLUME_1L) &
-				  ARIZONA_IN1L_SRC_MASK;
-		right_mux = snd_soc_read(codec, ARIZONA_ADC_DIGITAL_VOLUME_1R) &
-				  ARIZONA_IN1R_SRC_MASK;
-
-		/* Only IN1A can be digital, IN1B is always analogue */
-		in1mode = (arizona->pdata.inmode[0] & 2)
-				<< (ARIZONA_IN1_MODE_SHIFT - 1);
-
-		if (in1mode != 0) {
-			/* if IN1A is digital, the only valid mux configs
-			 * are both channels A or both channels B.
-			 */
-			if (left_mux != right_mux) {
-				dev_err(arizona->dev,
-					"IN1=DMIC and IN1L Mux != IN1R Mux");
-				return -EINVAL;
-			}
-
-			/* IN1A is digital so need to ensure mode is set back
-			 * to analogue if IN1B is selected
-			 */
-			if (left_mux != 0)
-				in1mode = 0;
-		}
-
-		old = snd_soc_read(codec, ARIZONA_IN1L_CONTROL) &
-					ARIZONA_IN1_MODE_MASK;
-
-		if (old != in1mode)
-			snd_soc_update_bits(codec, ARIZONA_IN1L_CONTROL,
-						ARIZONA_IN1_MODE_MASK, in1mode);
-		return 0;
-
-	default:
-		return 0;
-	}
-}
-
-static int vegas_in2mux_ev(struct snd_soc_dapm_widget *w,
-				struct snd_kcontrol *kcontrol,
-				int event)
-{
-	struct snd_soc_codec *codec = w->codec;
-	struct arizona *arizona = dev_get_drvdata(codec->dev->parent);
-	unsigned int mux, in2mode, old;
-
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		mux = snd_soc_read(codec, ARIZONA_ADC_DIGITAL_VOLUME_2L) &
-				  ARIZONA_IN2L_SRC_MASK;
-
-		if (mux == 0)
-			in2mode = (arizona->pdata.inmode[1] & 2)
-				<< (ARIZONA_IN2_MODE_SHIFT - 1);
-		else
-			in2mode = 0;	/* IN2B always analogue */
-
-		old = snd_soc_read(codec, ARIZONA_IN2L_CONTROL) &
-					ARIZONA_IN2_MODE_MASK;
-
-		if (old != in2mode)
-			snd_soc_update_bits(codec, ARIZONA_IN2L_CONTROL,
-						ARIZONA_IN2_MODE_MASK, in2mode);
-		return 0;
-
-	default:
-		return 0;
-	}
-}
 
 static int vegas_set_fll(struct snd_soc_codec *codec, int fll_id, int source,
 			  unsigned int Fref, unsigned int Fout)

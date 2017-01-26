@@ -102,7 +102,8 @@ static void arizona_micsupp_check_cp(struct work_struct *work)
 	}
 
 	if (dapm) {
-		mutex_lock(&dapm->card->dapm_mutex);
+		mutex_lock_nested(&dapm->card->dapm_mutex,
+				  SND_SOC_DAPM_CLASS_RUNTIME);
 
 		if ((reg & (ARIZONA_CPMIC_ENA | ARIZONA_CPMIC_BYPASS)) ==
 		    ARIZONA_CPMIC_ENA) {
@@ -252,6 +253,9 @@ static int arizona_micsupp_of_get_pdata(struct arizona *arizona,
 		if (init_data) {
 			init_data->consumer_supplies = &micsupp->supply;
 			init_data->num_consumer_supplies = 1;
+
+			init_data->constraints.valid_ops_mask |=
+					REGULATOR_CHANGE_BYPASS;
 
 			pdata->micvdd = init_data;
 		}
