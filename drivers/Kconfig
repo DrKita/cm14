@@ -186,8 +186,7 @@ source "drivers/sensorhub/brcm/Kconfig"
 
 source "drivers/sensors/Kconfig"
 
-# already included by net/nfc/Kconfig
-#source "drivers/nfc/Kconfig"
+source "drivers/nfc/Kconfig"
 
 source "drivers/gps/Kconfig"
 
